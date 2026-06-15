@@ -6,6 +6,19 @@ Aby55 是一个为 M5Stack Tab5 做的小型电子乐器实验：一台可以放
 
 This is a community project and is not affiliated with M5Stack, Espressif, or any commercial instrument brand.
 
+## UI Previews
+
+These are generated UI previews for the four Aby55 pages. They are included as
+visual references until real device screenshots are available.
+
+| MIX | DRUM |
+| --- | --- |
+| ![Aby55 MIX page generated preview](docs/screenshots/mix-preview.png) | ![Aby55 DRUM page generated preview](docs/screenshots/drum-preview.png) |
+
+| BASS | DRUM SYN |
+| --- | --- |
+| ![Aby55 BASS page generated preview](docs/screenshots/bass-preview.png) | ![Aby55 DRUM SYN page generated preview](docs/screenshots/drum-syn-preview.png) |
+
 ## Features
 
 - Four performance pages: `MIX`, `DRUM`, `BASS`, and `DRUM SYN`.
