@@ -1,0 +1,13 @@
+build/
+build_*/
+dist/
+managed_components/
+official_*demo*/
+sdkconfig
+sdkconfig.old
+.vscode/
+.venv*/
+__pycache__/
+*.pyc
+*.zip
+*.log
