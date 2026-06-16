@@ -38,6 +38,11 @@ enum class MixEqBand : uint8_t {
     High,
 };
 
+enum class OutputProfile : uint8_t {
+    Speaker = 0,
+    Headphone,
+};
+
 enum class BassWave : uint8_t {
     Saw = 0,
     Square,
@@ -138,6 +143,14 @@ struct TransportState {
     uint32_t motion_generation = 0;
     uint8_t motion_capture_bars = 0;
     bool motion_capture_active = false;
+    uint32_t audio_clip_count = 0;
+    uint8_t audio_peak_percent = 0;
+    uint8_t limiter_gain_reduction_percent = 0;
+    uint8_t bass_env_stage = 0;
+    uint32_t audio_overrun_count = 0;
+    uint32_t audio_block_peak_us = 0;
+    bool audio_load_shed = false;
+    OutputProfile output_profile = OutputProfile::Speaker;
     BassParams bass_params;
     std::array<DrumVoiceParams, kVoiceCount> drum_voice_params = {};
     DrumVoice selected_drum_voice = DrumVoice::Kick;

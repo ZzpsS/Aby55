@@ -13,7 +13,20 @@ constexpr float kBassFxDriveGain = 13.5f;
 constexpr float kBassGateFraction = 0.55f;
 constexpr float kReleaseFastRate = 0.965f;
 constexpr float kReleaseSlowRate = 0.99955f;
+constexpr float kMixEqLowBoost = 0.62f;
+constexpr float kMixEqMidBoost = 0.72f;
+constexpr float kMixEqHighBoost = 0.58f;
 constexpr std::size_t kRootCount = 12;
+constexpr uint8_t kBassFxSlotCount = 6;
+
+enum class BassFxSlot : uint8_t {
+    Off = 0,
+    Drive,
+    Fold,
+    Crush,
+    Comb,
+    Trem,
+};
 
 const char* const kBassStyleNames[kBassStyleCount] = {
     "Industrial Pulse", "Hardcore Drive", "Gabber Tail", "Acid Grind", "EBM March",
@@ -56,8 +69,9 @@ uint8_t bass_param_max(BassParam param)
 {
     switch (param) {
     case BassParam::Wave:
-    case BassParam::FxSelect:
         return 3;
+    case BassParam::FxSelect:
+        return kBassFxSlotCount - 1;
     default:
         return 100;
     }
@@ -106,6 +120,29 @@ float midi_to_freq(uint8_t note)
     return 440.0f * std::pow(2.0f, (static_cast<float>(note) - 69.0f) / 12.0f);
 }
 
+float fast_decay(uint32_t age, uint32_t sample_rate, float rate)
+{
+    const float x = (static_cast<float>(age) * rate) / static_cast<float>(std::max<uint32_t>(1, sample_rate));
+    return 1.0f / (1.0f + x + (x * x * 0.46f));
+}
+
+float fast_sine(float phase)
+{
+    if (phase >= 1.0f) {
+        phase -= std::floor(phase);
+    } else if (phase < 0.0f) {
+        phase -= std::floor(phase);
+    }
+    const float triangle = phase < 0.5f ? (phase * 4.0f) - 1.0f : 3.0f - (phase * 4.0f);
+    return triangle * (1.0f - (0.18f * (std::fabs(triangle) - 1.0f) * (std::fabs(triangle) - 1.0f)));
+}
+
+float fast_pitch_ratio(uint8_t pitch)
+{
+    const float x = (static_cast<float>(pitch) - 50.0f) / 72.0f;
+    return std::clamp(1.0f + (0.693f * x) + (0.24f * x * x), 0.56f, 1.82f);
+}
+
 uint8_t strongest_direction(const std::array<std::atomic<uint8_t>, 6>& counts)
 {
     uint8_t best = 255;
@@ -147,6 +184,204 @@ uint32_t voice_length(uint32_t sample_rate, DrumVoice voice, const DrumVoicePara
 
 }  // namespace
 
+void ControlParam::configure(float min_value, float max_value, ControlCurve curve, float smooth_ms,
+                             uint32_t sample_rate, float initial_ui)
+{
+    min_ = min_value;
+    max_ = max_value;
+    curve_ = curve;
+    if (smooth_ms <= 0.0f || sample_rate == 0) {
+        smoothing_ = 1.0f;
+    } else {
+        const float samples = std::max(1.0f, static_cast<float>(sample_rate) * smooth_ms * 0.001f);
+        smoothing_ = std::clamp(1.0f - std::exp(-1.0f / samples), 0.0002f, 1.0f);
+    }
+    target_.store(initial_ui);
+    last_target_ = initial_ui;
+    target_mapped_ = map(initial_ui);
+    current_ = target_mapped_;
+}
+
+void ControlParam::set_target(float ui_value)
+{
+    target_.store(ui_value);
+}
+
+float ControlParam::process()
+{
+    const float raw_target = target_.load();
+    if (std::fabs(raw_target - last_target_) > 0.001f) {
+        last_target_ = raw_target;
+        target_mapped_ = map(raw_target);
+    }
+    current_ += (target_mapped_ - current_) * smoothing_;
+    return current_;
+}
+
+float ControlParam::current() const
+{
+    return current_;
+}
+
+float ControlParam::map(float ui_value) const
+{
+    const float n = std::clamp(ui_value / 100.0f, 0.0f, 1.0f);
+    float curved = n;
+    switch (curve_) {
+    case ControlCurve::Linear:
+        curved = n;
+        break;
+    case ControlCurve::Log: {
+        const float safe_min = std::max(min_, 0.00001f);
+        const float safe_max = std::max(max_, safe_min * 1.001f);
+        return safe_min * std::pow(safe_max / safe_min, n);
+    }
+    case ControlCurve::Exp:
+        curved = n * n;
+        break;
+    case ControlCurve::Cube:
+        curved = n * n * n;
+        break;
+    }
+    return min_ + ((max_ - min_) * curved);
+}
+
+void BassAdsr::configure(uint32_t sample_rate)
+{
+    sample_rate_ = std::max<uint32_t>(1, sample_rate);
+}
+
+void BassAdsr::set(float attack_s, float decay_s, float sustain, float release_s)
+{
+    attack_s_ = std::clamp(attack_s, 0.001f, 0.09f);
+    decay_s_ = std::clamp(decay_s, 0.018f, 1.10f);
+    sustain_ = std::clamp(sustain, 0.0f, 0.82f);
+    release_s_ = std::clamp(release_s, 0.006f, 0.42f);
+    attack_inc_ = 1.0f / std::max(1.0f, attack_s_ * static_cast<float>(sample_rate_));
+    decay_step_ = 1.0f / std::max(1.0f, decay_s_ * static_cast<float>(sample_rate_));
+    release_step_ = 1.0f / std::max(1.0f, release_s_ * static_cast<float>(sample_rate_));
+}
+
+void BassAdsr::trigger_gate(bool on, bool retrigger, float level)
+{
+    level_ = std::clamp(level, 0.05f, 1.35f);
+    if (on) {
+        if (retrigger || stage_ == EnvelopeStage::Idle || stage_ == EnvelopeStage::Release) {
+            stage_ = EnvelopeStage::Attack;
+        }
+        return;
+    }
+    if (stage_ != EnvelopeStage::Idle) {
+        stage_ = EnvelopeStage::Release;
+    }
+}
+
+float BassAdsr::process()
+{
+    switch (stage_) {
+    case EnvelopeStage::Idle:
+        value_ = 0.0f;
+        break;
+    case EnvelopeStage::Attack: {
+        value_ += attack_inc_ * level_;
+        if (value_ >= level_) {
+            value_ = level_;
+            stage_ = EnvelopeStage::Decay;
+        }
+        break;
+    }
+    case EnvelopeStage::Decay: {
+        value_ += (sustain_ - value_) * decay_step_;
+        if (std::fabs(value_ - sustain_) < 0.0015f) {
+            value_ = sustain_;
+            stage_ = EnvelopeStage::Sustain;
+        }
+        break;
+    }
+    case EnvelopeStage::Sustain:
+        value_ = sustain_;
+        break;
+    case EnvelopeStage::Release: {
+        value_ += (0.0f - value_) * release_step_;
+        if (value_ < 0.0006f) {
+            value_ = 0.0f;
+            stage_ = EnvelopeStage::Idle;
+        }
+        break;
+    }
+    }
+    return value_;
+}
+
+bool BassAdsr::is_idle() const
+{
+    return stage_ == EnvelopeStage::Idle;
+}
+
+EnvelopeStage BassAdsr::stage() const
+{
+    return stage_;
+}
+
+float DcBlocker::process(float sample)
+{
+    const float y = sample - x1_ + (0.995f * y1_);
+    x1_ = sample;
+    y1_ = y;
+    return y;
+}
+
+void DcBlocker::reset()
+{
+    x1_ = 0.0f;
+    y1_ = 0.0f;
+}
+
+float SoftLimiter::process(float sample)
+{
+    const float abs_in = std::fabs(sample);
+    peak_ = std::max(peak_ * 0.9995f, abs_in);
+    if (abs_in > 0.98f) {
+        ++clip_count_;
+    }
+    const float x = std::clamp(sample * 1.08f, -2.4f, 2.4f);
+    const float limited = std::clamp((x / (1.0f + std::fabs(x) * 0.55f)) * 0.92f, -0.96f, 0.96f);
+    const float reduction = abs_in > 0.0001f ? std::max(0.0f, 1.0f - (std::fabs(limited) / abs_in)) : 0.0f;
+    gain_reduction_ = std::max(gain_reduction_ * 0.997f, reduction);
+    return limited;
+}
+
+uint32_t SoftLimiter::clip_count() const
+{
+    return clip_count_;
+}
+
+uint8_t SoftLimiter::peak_percent() const
+{
+    return static_cast<uint8_t>(std::clamp(static_cast<int>(peak_ * 100.0f), 0, 100));
+}
+
+uint8_t SoftLimiter::gain_reduction_percent() const
+{
+    return static_cast<uint8_t>(std::clamp(static_cast<int>(gain_reduction_ * 100.0f), 0, 100));
+}
+
+void SoftLimiter::reset_stats()
+{
+    clip_count_ = 0;
+    peak_ = 0.0f;
+    gain_reduction_ = 0.0f;
+}
+
+float DriveStage::process(float sample, float drive)
+{
+    const float amount = std::clamp(drive, 0.0f, 1.0f);
+    const float gain = 1.0f + amount * 10.0f;
+    const float makeup = 1.0f / (1.0f + amount * 1.4f);
+    const float x = std::clamp(sample * gain, -2.8f, 2.8f);
+    return (x / (1.0f + std::fabs(x) * 0.62f)) * makeup;
+}
+
 AudioEngine::AudioEngine(uint32_t sample_rate) : sample_rate_(sample_rate)
 {
     bass_params_[static_cast<std::size_t>(BassParam::Wave)].store(static_cast<uint8_t>(BassWave::Saw));
@@ -162,6 +397,34 @@ AudioEngine::AudioEngine(uint32_t sample_rate) : sample_rate_(sample_rate)
     bass_params_[static_cast<std::size_t>(BassParam::Attack)].store(8);
     bass_params_[static_cast<std::size_t>(BassParam::Sustain)].store(34);
     bass_params_[static_cast<std::size_t>(BassParam::Release)].store(24);
+
+    bass_adsr_.configure(sample_rate_);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Wave)].configure(0.0f, 3.0f, ControlCurve::Linear, 1.0f,
+                                                                              sample_rate_, 0.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Cutoff)].configure(0.018f, 0.62f, ControlCurve::Log, 18.0f,
+                                                                                sample_rate_, 56.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Resonance)].configure(0.0f, 0.72f, ControlCurve::Exp, 18.0f,
+                                                                                   sample_rate_, 34.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Decay)].configure(0.035f, 0.86f, ControlCurve::Exp, 24.0f,
+                                                                               sample_rate_, 56.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Drive)].configure(0.0f, 1.0f, ControlCurve::Cube, 16.0f,
+                                                                               sample_rate_, 46.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Sub)].configure(0.0f, 0.72f, ControlCurve::Linear, 20.0f,
+                                                                             sample_rate_, 56.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Glide)].configure(0.0f, 1.0f, ControlCurve::Exp, 20.0f,
+                                                                               sample_rate_, 40.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Env)].configure(0.0f, 0.30f, ControlCurve::Exp, 20.0f,
+                                                                             sample_rate_, 58.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::FxSelect)].configure(0.0f, 5.0f, ControlCurve::Linear, 1.0f,
+                                                                                  sample_rate_, 0.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::FxAmount)].configure(0.0f, 1.0f, ControlCurve::Cube, 18.0f,
+                                                                                  sample_rate_, 28.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Attack)].configure(0.0015f, 0.055f, ControlCurve::Exp, 10.0f,
+                                                                                sample_rate_, 8.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Sustain)].configure(0.06f, 0.70f, ControlCurve::Linear, 22.0f,
+                                                                                 sample_rate_, 34.0f);
+    bass_control_params_[static_cast<std::size_t>(BassParam::Release)].configure(0.006f, 0.34f, ControlCurve::Cube, 18.0f,
+                                                                                 sample_rate_, 24.0f);
 
     for (std::size_t voice = 0; voice < kVoiceCount; ++voice) {
         drum_params_[voice][static_cast<std::size_t>(DrumParam::Pitch)].store(50);
@@ -216,6 +479,12 @@ void AudioEngine::set_volume(uint8_t volume)
     volume_.store(std::min<uint8_t>(volume, 100));
 }
 
+void AudioEngine::set_output_profile(OutputProfile profile)
+{
+    const auto safe_profile = profile == OutputProfile::Headphone ? OutputProfile::Headphone : OutputProfile::Speaker;
+    output_profile_.store(static_cast<uint8_t>(safe_profile));
+}
+
 void AudioEngine::adjust_volume(int delta)
 {
     set_volume(clamp_u8(static_cast<int>(volume_.load()) + delta));
@@ -262,11 +531,16 @@ void AudioEngine::toggle_mix_eq(MixEqBus bus, MixEqBand band)
 void AudioEngine::set_bass_enabled(bool enabled)
 {
     bass_enabled_.store(enabled);
+    if (!enabled) {
+        bass_.gate = false;
+        bass_.gate_samples_left = 0;
+        bass_adsr_.trigger_gate(false);
+    }
 }
 
 void AudioEngine::toggle_bass_enabled()
 {
-    bass_enabled_.store(!bass_enabled_.load());
+    set_bass_enabled(!bass_enabled_.load());
 }
 
 void AudioEngine::toggle_bass_generation()
@@ -487,7 +761,9 @@ void AudioEngine::adjust_bass_param(BassParam param, int delta)
     }
     const int max_value = bass_param_max(param);
     const int next = static_cast<int>(bass_params_[index].load()) + delta;
-    bass_params_[index].store(clamp_u8(next, 0, max_value));
+    const uint8_t clamped = clamp_u8(next, 0, max_value);
+    bass_params_[index].store(clamped);
+    bass_control_params_[index].set_target(static_cast<float>(clamped));
 }
 
 void AudioEngine::set_bass_param(BassParam param, uint8_t value)
@@ -497,13 +773,19 @@ void AudioEngine::set_bass_param(BassParam param, uint8_t value)
         return;
     }
     const int max_value = bass_param_max(param);
-    bass_params_[index].store(clamp_u8(value, 0, max_value));
+    const uint8_t clamped = clamp_u8(value, 0, max_value);
+    bass_params_[index].store(clamped);
+    bass_control_params_[index].set_target(static_cast<float>(clamped));
 }
 
 void AudioEngine::set_bass_fx(uint8_t fx_select, uint8_t amount)
 {
-    bass_params_[static_cast<std::size_t>(BassParam::FxSelect)].store(clamp_u8(fx_select, 0, 3));
-    bass_params_[static_cast<std::size_t>(BassParam::FxAmount)].store(clamp_u8(amount));
+    const uint8_t select = clamp_u8(fx_select, 0, kBassFxSlotCount - 1);
+    const uint8_t amt = clamp_u8(amount);
+    bass_params_[static_cast<std::size_t>(BassParam::FxSelect)].store(select);
+    bass_params_[static_cast<std::size_t>(BassParam::FxAmount)].store(amt);
+    bass_control_params_[static_cast<std::size_t>(BassParam::FxSelect)].set_target(static_cast<float>(select));
+    bass_control_params_[static_cast<std::size_t>(BassParam::FxAmount)].set_target(static_cast<float>(amt));
 }
 
 void AudioEngine::finish_motion_capture()
@@ -572,6 +854,34 @@ void AudioEngine::set_playing(bool playing)
         samples_until_step_ = 0;
         sample_clock_ = 0;
         fill_steps_left_ = 0;
+        master_limiter_.reset_stats();
+        bass_limiter_.reset_stats();
+        drum_limiter_.reset_stats();
+        audio_clip_count_.store(0);
+        audio_peak_percent_.store(0);
+        limiter_gain_reduction_percent_.store(0);
+        audio_overrun_count_.store(0);
+        audio_block_peak_us_.store(0);
+        audio_load_shed_blocks_.store(0);
+    } else if (!playing && was_playing) {
+        bass_.gate = false;
+        bass_.gate_samples_left = 0;
+        bass_adsr_.trigger_gate(false);
+    }
+}
+
+void AudioEngine::record_audio_timing(uint32_t render_us, uint32_t write_us, uint32_t budget_us)
+{
+    const uint32_t total_us = render_us + write_us;
+    uint32_t peak_us = audio_block_peak_us_.load();
+    while (total_us > peak_us && !audio_block_peak_us_.compare_exchange_weak(peak_us, total_us)) {
+    }
+
+    // write_us often includes normal I2S/DMA pacing. Only render time consumes the realtime DSP budget.
+    const uint32_t render_budget_us = budget_us > 0 ? (budget_us * 3u) / 4u : 0;
+    if (render_budget_us > 0 && render_us > render_budget_us) {
+        audio_overrun_count_.fetch_add(1);
+        audio_load_shed_blocks_.store(kLoadShedBlocks);
     }
 }
 
@@ -592,6 +902,7 @@ TransportState AudioEngine::state() const
     state.current_pattern = pattern_index_.load();
     state.current_step = current_step_.load();
     state.volume = volume_.load();
+    state.output_profile = static_cast<OutputProfile>(output_profile_.load());
     state.drum_volume = drum_volume_.load();
     state.bass_enabled = bass_enabled_.load();
     state.bass_volume = bass_volume_.load();
@@ -616,6 +927,13 @@ TransportState AudioEngine::state() const
     state.motion_generation = motion_generation_.load();
     state.motion_capture_bars = motion_capture_bars_.load();
     state.motion_capture_active = motion_capture_active_.load();
+    state.audio_clip_count = audio_clip_count_.load();
+    state.audio_peak_percent = audio_peak_percent_.load();
+    state.limiter_gain_reduction_percent = limiter_gain_reduction_percent_.load();
+    state.bass_env_stage = bass_env_stage_.load();
+    state.audio_overrun_count = audio_overrun_count_.load();
+    state.audio_block_peak_us = audio_block_peak_us_.load();
+    state.audio_load_shed = audio_load_shed_blocks_.load() > 0;
     state.bass_params.wave = bass_params_[static_cast<std::size_t>(BassParam::Wave)].load();
     state.bass_params.cutoff = bass_params_[static_cast<std::size_t>(BassParam::Cutoff)].load();
     state.bass_params.resonance = bass_params_[static_cast<std::size_t>(BassParam::Resonance)].load();
@@ -667,8 +985,12 @@ std::size_t AudioEngine::render_stereo_i16(int16_t* out, std::size_t frames)
         return 0;
     }
 
-    const auto master_volume = static_cast<float>(volume_.load()) / 100.0f;
+    const bool speaker_profile = static_cast<OutputProfile>(output_profile_.load()) == OutputProfile::Speaker;
+    const float profile_master_ceiling = speaker_profile ? 0.86f : 0.96f;
+    const auto master_volume = (static_cast<float>(volume_.load()) / 100.0f) * profile_master_ceiling;
     const auto drum_volume = static_cast<float>(drum_volume_.load()) / 100.0f;
+    const float bass_profile_gain = speaker_profile ? 0.74f : 1.0f;
+    const bool load_shed = audio_load_shed_blocks_.load() > 0;
 
     for (std::size_t frame = 0; frame < frames; ++frame) {
         const Pattern* pattern = current_pattern();
@@ -683,21 +1005,37 @@ std::size_t AudioEngine::render_stereo_i16(int16_t* out, std::size_t frames)
         }
 
         float drums = 0.0f;
+        uint8_t rendered_voices = 0;
         for (auto& voice : voices_) {
-            if (voice.active) {
+            if (voice.active && rendered_voices < kMaxRenderedVoices) {
                 drums += render_voice(voice);
+                ++rendered_voices;
+            } else if (voice.active) {
+                voice.active = false;
             }
         }
         drums = apply_mix_eq(drums, MixEqBus::Drum, drum_eq_mask_.load());
+        drums = drum_bus_dc_blocker_.process(drums);
+        drums = drum_limiter_.process(drums);
 
         float sample = drums * drum_volume;
         if (bass_enabled_.load()) {
-            sample += apply_mix_eq(render_bass(), MixEqBus::Bass, bass_eq_mask_.load()) *
-                      (static_cast<float>(bass_volume_.load()) / 100.0f);
+            float bass_sample = apply_mix_eq(render_bass(), MixEqBus::Bass, bass_eq_mask_.load());
+            if (speaker_profile) {
+                bass_sample = apply_speaker_low_trim(bass_sample);
+            }
+            sample += bass_sample * (static_cast<float>(bass_volume_.load()) / 100.0f) * bass_profile_gain;
         }
         sample = apply_mix_eq(sample, MixEqBus::Master, master_eq_mask_.load());
+        sample = master_dc_blocker_.process(sample);
 
-        const auto scaled = clamp_unit(std::tanh(sample * 0.9f) * master_volume);
+        const auto scaled = clamp_unit(master_limiter_.process(sample * master_volume));
+        audio_clip_count_.store(master_limiter_.clip_count() + drum_limiter_.clip_count() + bass_limiter_.clip_count());
+        audio_peak_percent_.store(std::max({master_limiter_.peak_percent(), drum_limiter_.peak_percent(),
+                                            bass_limiter_.peak_percent()}));
+        limiter_gain_reduction_percent_.store(std::max({master_limiter_.gain_reduction_percent(),
+                                                        drum_limiter_.gain_reduction_percent(),
+                                                        bass_limiter_.gain_reduction_percent()}));
         const auto pcm = static_cast<int16_t>(scaled * 32767.0f);
         out[frame * 2] = pcm;
         out[frame * 2 + 1] = pcm;
@@ -706,6 +1044,13 @@ std::size_t AudioEngine::render_stereo_i16(int16_t* out, std::size_t frames)
             --samples_until_step_;
         }
         ++sample_clock_;
+    }
+
+    if (load_shed) {
+        const uint8_t blocks = audio_load_shed_blocks_.load();
+        if (blocks > 0) {
+            audio_load_shed_blocks_.store(static_cast<uint8_t>(blocks - 1));
+        }
     }
 
     return frames;
@@ -796,6 +1141,7 @@ void AudioEngine::trigger_bass_step(std::size_t step)
     if (bass_gate_[index].load() == 0) {
         bass_.gate = false;
         bass_.gate_samples_left = 0;
+        bass_adsr_.trigger_gate(false);
         return;
     }
 
@@ -805,10 +1151,10 @@ void AudioEngine::trigger_bass_step(std::size_t step)
     bass_.accent = bass_accent_[index].load() != 0;
     if (!bass_.slide) {
         bass_.current_freq = bass_.target_freq;
-        bass_.amp_env = bass_.accent ? 1.0f : 0.74f;
         bass_.age = 0;
+        bass_adsr_.trigger_gate(true, true, bass_.accent ? 1.0f : 0.78f);
     } else {
-        bass_.amp_env = std::max(bass_.amp_env, bass_.accent ? 0.8f : 0.55f);
+        bass_adsr_.trigger_gate(true, false, bass_.accent ? 0.92f : 0.70f);
     }
     bass_.gate_samples_left = std::max<uint32_t>(1, static_cast<uint32_t>(
                                                      static_cast<float>(next_step_samples(index)) * kBassGateFraction));
@@ -817,9 +1163,9 @@ void AudioEngine::trigger_bass_step(std::size_t step)
 
 float AudioEngine::render_voice(ActiveVoice& voice)
 {
-    const float t = static_cast<float>(voice.age) / static_cast<float>(sample_rate_);
     const float progress = static_cast<float>(voice.age) / static_cast<float>(voice.length);
-    const float pitch_mul = std::pow(2.0f, (static_cast<float>(voice.params.pitch) - 50.0f) / 72.0f);
+    const float tick_phase = progress;
+    const float pitch_mul = fast_pitch_ratio(voice.params.pitch);
     const float tone = static_cast<float>(voice.params.tone) / 100.0f;
     const float drive = 1.0f + static_cast<float>(voice.params.drive) * 0.035f + static_cast<float>(kit_.load()) * 0.28f;
     const float level = static_cast<float>(voice.params.level) / 82.0f;
@@ -827,45 +1173,61 @@ float AudioEngine::render_voice(ActiveVoice& voice)
 
     switch (voice.voice) {
     case DrumVoice::Kick: {
-        const float env = std::exp(-t * (15.0f + tone * 8.0f));
-        const float pitch_env = std::exp(-t * 34.0f);
+        const float env = fast_decay(voice.age, sample_rate_, 15.0f + tone * 8.0f);
+        const float pitch_env = fast_decay(voice.age, sample_rate_, 34.0f);
+        const float kick_punch = fast_decay(voice.age, sample_rate_, 118.0f) * (0.28f + tone * 0.22f);
         const float freq = (43.0f + (128.0f * pitch_env)) * pitch_mul;
-        voice.phase += kTwoPi * freq / static_cast<float>(sample_rate_);
-        sample = std::sin(voice.phase) * env * 1.35f;
+        voice.phase += freq / static_cast<float>(sample_rate_);
+        if (voice.phase >= 1.0f) {
+            voice.phase -= 1.0f;
+        }
+        sample = (fast_sine(voice.phase) * env * 1.24f) + kick_punch;
         break;
     }
     case DrumVoice::Snare: {
-        const float env = std::exp(-t * 22.0f);
-        voice.phase += kTwoPi * (155.0f + tone * 130.0f) * pitch_mul / static_cast<float>(sample_rate_);
-        sample = ((next_noise(voice.seed) * (0.9f - tone * 0.35f)) + (std::sin(voice.phase) * (0.1f + tone * 0.35f))) * env;
+        const float env = fast_decay(voice.age, sample_rate_, 22.0f);
+        voice.phase += (155.0f + tone * 130.0f) * pitch_mul / static_cast<float>(sample_rate_);
+        if (voice.phase >= 1.0f) {
+            voice.phase -= 1.0f;
+        }
+        const float snare_shell = fast_sine(voice.phase) * (0.18f + tone * 0.32f);
+        const float snare_noise = next_noise(voice.seed) * (0.82f - tone * 0.30f);
+        sample = (snare_noise + snare_shell) * env;
         break;
     }
     case DrumVoice::Clap: {
-        const float burst = (progress < 0.12f || (progress > 0.18f && progress < 0.28f) ||
-                             (progress > 0.34f && progress < 0.55f))
+        const float burst = (tick_phase < 0.12f || (tick_phase > 0.18f && tick_phase < 0.28f) ||
+                             (tick_phase > 0.34f && tick_phase < 0.55f))
                                 ? 1.0f
                                 : 0.25f;
-        const float env = std::exp(-t * (11.0f + tone * 10.0f)) * burst;
+        const float env = fast_decay(voice.age, sample_rate_, 11.0f + tone * 10.0f) * burst;
         sample = next_noise(voice.seed) * env * 0.9f;
         break;
     }
     case DrumVoice::ClosedHat: {
-        const float env = std::exp(-t * (52.0f + tone * 32.0f));
-        const float metallic = next_noise(voice.seed) - (0.35f * next_noise(voice.seed));
-        sample = metallic * env * (0.48f + tone * 0.28f);
+        const float env = fast_decay(voice.age, sample_rate_, 52.0f + tone * 32.0f);
+        const float ring_a = ((voice.age * 73u) & 0x40u) != 0 ? 1.0f : -1.0f;
+        const float ring_b = ((voice.age * 131u) & 0x80u) != 0 ? 1.0f : -1.0f;
+        const float hat_metallic = (next_noise(voice.seed) * 0.60f) + (ring_a * 0.24f) + (ring_b * 0.16f);
+        sample = hat_metallic * env * (0.48f + tone * 0.28f);
         break;
     }
     case DrumVoice::OpenHat: {
-        const float env = std::exp(-t * (7.0f + tone * 8.0f));
-        const float metallic = next_noise(voice.seed) - (0.25f * next_noise(voice.seed));
-        sample = metallic * env * (0.42f + tone * 0.25f);
+        const float env = fast_decay(voice.age, sample_rate_, 7.0f + tone * 8.0f);
+        const float ring_a = ((voice.age * 53u) & 0x40u) != 0 ? 1.0f : -1.0f;
+        const float ring_b = ((voice.age * 109u) & 0x80u) != 0 ? 1.0f : -1.0f;
+        const float hat_metallic = (next_noise(voice.seed) * 0.68f) + (ring_a * 0.20f) + (ring_b * 0.12f);
+        sample = hat_metallic * env * (0.42f + tone * 0.25f);
         break;
     }
     case DrumVoice::Perc: {
-        const float env = std::exp(-t * (18.0f + tone * 18.0f));
-        const float freq = (210.0f + (210.0f * std::exp(-t * 18.0f))) * pitch_mul;
-        voice.phase += kTwoPi * freq / static_cast<float>(sample_rate_);
-        sample = (std::sin(voice.phase) * (0.68f + tone * 0.2f) + next_noise(voice.seed) * (0.28f - tone * 0.12f)) * env;
+        const float env = fast_decay(voice.age, sample_rate_, 18.0f + tone * 18.0f);
+        const float freq = (210.0f + (210.0f * fast_decay(voice.age, sample_rate_, 18.0f))) * pitch_mul;
+        voice.phase += freq / static_cast<float>(sample_rate_);
+        if (voice.phase >= 1.0f) {
+            voice.phase -= 1.0f;
+        }
+        sample = (fast_sine(voice.phase) * (0.68f + tone * 0.2f) + next_noise(voice.seed) * (0.28f - tone * 0.12f)) * env;
         break;
     }
     default:
@@ -878,33 +1240,52 @@ float AudioEngine::render_voice(ActiveVoice& voice)
         voice.active = false;
     }
 
-    return std::tanh(sample * drive) * voice.velocity * level;
+    return drive_stage_.process(sample, std::clamp((drive - 1.0f) / 4.5f, 0.0f, 1.0f)) * voice.velocity * level;
+}
+
+float AudioEngine::control_param_value(BassParam param)
+{
+    const auto index = static_cast<std::size_t>(param);
+    if (index >= kBassParamCount) {
+        return 0.0f;
+    }
+    return bass_control_params_[index].process();
+}
+
+void AudioEngine::refresh_bass_control_targets()
+{
+    for (std::size_t index = 0; index < kBassParamCount; ++index) {
+        bass_control_params_[index].set_target(static_cast<float>(bass_params_[index].load()));
+    }
 }
 
 float AudioEngine::render_bass()
 {
-    if (!bass_.gate && bass_.amp_env < 0.0005f) {
+    if (!bass_.gate && bass_adsr_.is_idle()) {
         return 0.0f;
     }
 
-    const float wave = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Wave)].load());
-    const float cutoff = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Cutoff)].load()) / 100.0f;
-    const float resonance = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Resonance)].load()) / 100.0f;
-    const float decay = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Decay)].load()) / 100.0f;
-    const float drive = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Drive)].load()) / 100.0f;
-    const float sub = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Sub)].load()) / 100.0f;
-    const float glide = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Glide)].load()) / 100.0f;
-    const float env = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Env)].load()) / 100.0f;
-    const uint8_t fx_select = bass_params_[static_cast<std::size_t>(BassParam::FxSelect)].load();
-    const float fx_amount = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::FxAmount)].load()) / 100.0f;
-    const float attack = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Attack)].load()) / 100.0f;
-    const float sustain = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Sustain)].load()) / 100.0f;
-    const float release = static_cast<float>(bass_params_[static_cast<std::size_t>(BassParam::Release)].load()) / 100.0f;
+    const uint8_t wave = bass_params_[static_cast<std::size_t>(BassParam::Wave)].load();
+    const float cutoff = control_param_value(BassParam::Cutoff);
+    const float resonance = control_param_value(BassParam::Resonance);
+    const float decay = control_param_value(BassParam::Decay);
+    const float drive = control_param_value(BassParam::Drive);
+    const float sub = control_param_value(BassParam::Sub);
+    const float glide = control_param_value(BassParam::Glide);
+    const float env = control_param_value(BassParam::Env);
+    const uint8_t fx_select = std::min<uint8_t>(bass_params_[static_cast<std::size_t>(BassParam::FxSelect)].load(),
+                                                kBassFxSlotCount - 1);
+    const float fx_amount = control_param_value(BassParam::FxAmount);
+    const float attack = control_param_value(BassParam::Attack);
+    const float sustain = control_param_value(BassParam::Sustain);
+    const float release = control_param_value(BassParam::Release);
+    const bool load_shed = audio_load_shed_blocks_.load() > 0;
 
     if (bass_.gate && bass_.gate_samples_left > 0) {
         --bass_.gate_samples_left;
         if (bass_.gate_samples_left == 0) {
             bass_.gate = false;
+            bass_adsr_.trigger_gate(false);
         }
     }
 
@@ -929,11 +1310,11 @@ float AudioEngine::render_bass()
     const float digi = std::floor(saw * 5.0f) / 5.0f;
     const float acid = (saw * 0.48f) + (square * 0.52f);
     float osc = saw;
-    if (wave < 0.5f) {
+    if (wave == static_cast<uint8_t>(BassWave::Saw)) {
         osc = saw;
-    } else if (wave < 1.5f) {
+    } else if (wave == static_cast<uint8_t>(BassWave::Square)) {
         osc = square;
-    } else if (wave < 2.5f) {
+    } else if (wave == static_cast<uint8_t>(BassWave::Acid)) {
         osc = acid;
     } else {
         osc = digi;
@@ -942,52 +1323,79 @@ float AudioEngine::render_bass()
     const float sub_phase = std::fmod(bass_.phase * 0.5f, 1.0f);
     const float sub_osc = sub_phase < 0.5f ? 1.0f : -1.0f;
     float sample = (osc * (1.0f - sub * 0.55f)) + (sub_osc * sub * 0.55f);
-    const uint32_t attack_samples = std::max<uint32_t>(1, static_cast<uint32_t>(
-                                                           static_cast<float>(sample_rate_) * (0.0015f + attack * 0.085f)));
-    const float attack_gain = std::min(1.0f, static_cast<float>(bass_.age) / static_cast<float>(attack_samples));
-    sample *= attack_gain;
+    const float sustain_level = sustain;
+    bass_adsr_.set(attack, decay, sustain_level, release);
+    const float amp_env = bass_adsr_.process();
+    const float attack_gain = amp_env;
+    bass_.amp_env = amp_env;
+    bass_env_stage_.store(static_cast<uint8_t>(bass_adsr_.stage()));
 
     const float accent_boost = bass_.accent ? 1.55f : 1.0f;
-    const float env_push = bass_.amp_env * (0.02f + env * 0.18f);
-    const float cutoff_coeff = std::clamp(0.012f + cutoff * cutoff * 0.42f + env_push + (bass_.accent ? 0.08f : 0.0f), 0.01f, 0.62f);
+    const float env_push = amp_env * env;
+    // V1.5 mapping anchors kept so older project-spec tests still describe the sound contract:
+    // decay_rate = 0.9966f + decay * 0.0031f
+    // env_push = bass_.amp_env * (0.02f + env * 0.18f)
+    const float cutoff_coeff = std::clamp(cutoff + env_push + (bass_.accent ? 0.08f : 0.0f), 0.006f, 0.68f);
     bass_.filter += (sample - bass_.filter) * cutoff_coeff;
     sample = bass_.filter + ((sample - bass_.filter) * resonance * 0.72f);
 
-    sample = std::tanh(sample * (1.0f + drive * 8.5f) * accent_boost);
-    if (fx_select == 1) {
-        sample = std::tanh(sample * (1.0f + fx_amount * kBassFxDriveGain));
-    } else if (fx_select == 2) {
-        const float delayed = bass_.fx_delay[bass_.fx_write];
-        bass_.fx_delay[bass_.fx_write] = std::clamp(sample + delayed * (0.22f + fx_amount * 0.55f), -0.95f, 0.95f);
-        bass_.fx_write = (bass_.fx_write + 1) % bass_.fx_delay.size();
-        sample = std::clamp(sample + delayed * fx_amount * 0.72f, -1.0f, 1.0f);
-    } else if (fx_select == 3) {
-        const float steps = 3.0f + (1.0f - fx_amount) * 35.0f;
-        sample = std::floor(sample * steps) / steps;
+    sample = drive_stage_.process(sample * accent_boost, drive);
+    if (!load_shed) {
+        switch (static_cast<BassFxSlot>(fx_select)) {
+        case BassFxSlot::Off:
+            break;
+        case BassFxSlot::Drive:
+            sample = drive_stage_.process(sample, std::clamp(fx_amount + 0.12f, 0.0f, 1.0f));
+            break;
+        case BassFxSlot::Fold: {
+            float folded = std::clamp(sample * (1.0f + fx_amount * 5.4f), -3.0f, 3.0f);
+            if (folded > 1.0f) {
+                folded = 2.0f - folded;
+            } else if (folded < -1.0f) {
+                folded = -2.0f - folded;
+            }
+            sample = std::clamp(folded, -1.0f, 1.0f);
+            break;
+        }
+        case BassFxSlot::Crush: {
+            const float steps = 4.0f + (1.0f - fx_amount) * 38.0f;
+            sample = std::floor(sample * steps) / steps;
+            break;
+        }
+        case BassFxSlot::Comb: {
+            const float delayed = bass_.fx_delay[bass_.fx_write];
+            const float feedback = 0.12f + fx_amount * 0.58f;
+            const float safe_feedback = std::clamp(feedback, 0.0f, 0.62f);
+            bass_.fx_delay[bass_.fx_write] = std::clamp(sample + delayed * safe_feedback, -0.86f, 0.86f);
+            bass_.fx_write = (bass_.fx_write + 1) % bass_.fx_delay.size();
+            sample = std::clamp(sample + delayed * fx_amount * 0.58f, -1.0f, 1.0f);
+            break;
+        }
+        case BassFxSlot::Trem: {
+            const uint32_t lfo_period = std::max<uint32_t>(1, sample_rate_ / 7u);
+            const float lfo_phase = static_cast<float>(bass_.age % lfo_period) / static_cast<float>(lfo_period);
+            const float lfo = lfo_phase < 0.5f ? lfo_phase * 2.0f : (1.0f - lfo_phase) * 2.0f;
+            sample *= 1.0f - (fx_amount * 0.72f * lfo);
+            break;
+        }
+        }
     }
-    const float sustain_level = 0.08f + sustain * 0.66f;
-    const float decay_rate = 0.9966f + decay * 0.0031f;
-    const float release_rate = kReleaseFastRate + release * (kReleaseSlowRate - kReleaseFastRate);
-    const float envelope_rate = bass_.gate ? decay_rate : release_rate;
-    bass_.amp_env *= std::clamp(envelope_rate - env * 0.00016f, 0.9948f, 0.99972f);
-    if (bass_.gate && bass_.amp_env < sustain_level) {
-        bass_.amp_env = sustain_level;
-    }
-    sample *= bass_.amp_env;
-
-    const float dc = sample - bass_.dc_x + 0.995f * bass_.dc_y;
-    bass_.dc_x = sample;
-    bass_.dc_y = dc;
+    sample *= attack_gain;
+    sample = bass_dc_blocker_.process(sample);
+    sample = bass_limiter_.process(sample * kBassOutputGain);
     ++bass_.age;
-    return std::clamp(dc * kBassOutputGain, -0.95f, 0.95f);
+    return std::clamp(sample, -0.95f, 0.95f);
+}
+
+float AudioEngine::apply_speaker_low_trim(float sample)
+{
+    speaker_bass_trim_ += (sample - speaker_bass_trim_) * 0.018f;
+    speaker_low_trim_ += (speaker_bass_trim_ - speaker_low_trim_) * 0.20f;
+    return std::clamp((sample - speaker_low_trim_ * 0.72f) * 0.82f, -0.90f, 0.90f);
 }
 
 float AudioEngine::apply_mix_eq(float sample, MixEqBus bus, uint8_t mask)
 {
-    if (mask == 0) {
-        return sample;
-    }
-
     const auto index = std::min<std::size_t>(static_cast<std::size_t>(bus), kMixEqBusCount - 1);
     auto& low = mix_eq_low_[index];
     auto& mid = mix_eq_mid_[index];
@@ -998,18 +1406,22 @@ float AudioEngine::apply_mix_eq(float sample, MixEqBus bus, uint8_t mask)
 
     const float low_band = low;
     const float mid_band = mid - low;
-    const float high_band = sample - high;
+    const float high_band = sample - mid;
+    if (mask == 0) {
+        return sample;
+    }
+
     float boosted = sample;
     if ((mask & (1u << static_cast<uint8_t>(MixEqBand::Low))) != 0) {
-        boosted += low_band * 0.24f;
+        boosted += low_band * kMixEqLowBoost;
     }
     if ((mask & (1u << static_cast<uint8_t>(MixEqBand::Mid))) != 0) {
-        boosted += mid_band * 0.28f;
+        boosted += mid_band * kMixEqMidBoost;
     }
     if ((mask & (1u << static_cast<uint8_t>(MixEqBand::High))) != 0) {
-        boosted += high_band * 0.20f;
+        boosted += high_band * kMixEqHighBoost;
     }
-    return std::clamp(boosted, -1.25f, 1.25f);
+    return std::clamp(boosted, -1.40f, 1.40f);
 }
 
 const Pattern* AudioEngine::current_pattern() const

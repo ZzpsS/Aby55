@@ -57,6 +57,18 @@ class ProjectSpecTest(unittest.TestCase):
         self.assertTrue((ROOT / "dependencies.lock").exists())
         self.assertIn('CONFIG_IDF_TARGET="esp32p4"', sdk_defaults)
 
+    def test_tab5_uses_custom_8mb_app_partition(self):
+        sdk_defaults = (ROOT / "sdkconfig.defaults").read_text(encoding="utf-8")
+        partitions_path = ROOT / "partitions.csv"
+        self.assertTrue(partitions_path.exists(), "Aby55 should use a custom partition table")
+        partitions = partitions_path.read_text(encoding="utf-8")
+
+        self.assertIn("CONFIG_PARTITION_TABLE_CUSTOM=y", sdk_defaults)
+        self.assertIn('CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"', sdk_defaults)
+        self.assertIn('CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"', sdk_defaults)
+        self.assertNotIn("CONFIG_PARTITION_TABLE_SINGLE_APP=y", sdk_defaults)
+        self.assertIn("factory,  app,  factory, 0x10000, 0x800000", partitions)
+
     def test_expected_firmware_interfaces_are_declared(self):
         headers = "\n".join(
             path.read_text(encoding="utf-8")
@@ -406,6 +418,278 @@ class ProjectSpecTest(unittest.TestCase):
             self.assertIn(token, app_source)
 
         self.assertNotIn("update_headphone_route();\n        g_audio.render_stereo_i16", app_source)
+
+    def test_v170_stability_and_sound_quality_dsp_guardrails(self):
+        transport_header = (ROOT / "main" / "include" / "transport.hpp").read_text(encoding="utf-8")
+        audio_header = (ROOT / "main" / "include" / "audio_engine.hpp").read_text(encoding="utf-8")
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+
+        for token in [
+            "enum class ControlCurve",
+            "class ControlParam",
+            "enum class EnvelopeStage",
+            "class BassAdsr",
+            "class DcBlocker",
+            "class SoftLimiter",
+            "class DriveStage",
+            "audio_clip_count",
+            "audio_peak_percent",
+            "bass_env_stage",
+        ]:
+            self.assertIn(token, transport_header + audio_header + audio_source)
+
+        for token in [
+            "bass_adsr_.trigger_gate",
+            "bass_adsr_.process()",
+            "bass_adsr_.is_idle()",
+            "bass_dc_blocker_.process",
+            "master_limiter_.process",
+            "drive_stage_.process",
+            "control_param_value(BassParam::Cutoff)",
+            "ControlCurve::Log",
+            "ControlCurve::Exp",
+            "ControlCurve::Cube",
+        ]:
+            self.assertIn(token, audio_header + audio_source)
+
+        for token in [
+            "kBassFxSlotCount = 6",
+            "BassFxSlot::Drive",
+            "BassFxSlot::Fold",
+            "BassFxSlot::Crush",
+            "BassFxSlot::Comb",
+            "BassFxSlot::Trem",
+            "std::clamp(feedback",
+        ]:
+            self.assertIn(token, audio_source)
+
+        for token in [
+            "kick_punch",
+            "snare_shell",
+            "snare_noise",
+            "hat_metallic",
+            "drum_bus_dc_blocker_",
+            "drum_limiter_",
+        ]:
+            self.assertIn(token, audio_header + audio_source)
+
+    def test_v171_audio_hot_path_avoids_expensive_transcendentals(self):
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+
+        def body_between(start, end):
+            start_index = audio_source.index(start)
+            end_index = audio_source.index(end, start_index)
+            return audio_source[start_index:end_index]
+
+        control_body = body_between("float ControlParam::process()", "float ControlParam::current()")
+        self.assertIn("target_mapped_", control_body)
+        self.assertNotIn("map(target_.load())", control_body)
+
+        for start, end in [
+            ("float BassAdsr::process()", "bool BassAdsr::is_idle()"),
+            ("float SoftLimiter::process(float sample)", "uint32_t SoftLimiter::clip_count()"),
+            ("float DriveStage::process(float sample, float drive)", "AudioEngine::AudioEngine"),
+        ]:
+            body = body_between(start, end)
+            self.assertNotIn("std::exp", body)
+            self.assertNotIn("std::tanh", body)
+
+        render_body = body_between("float AudioEngine::render_voice", "float AudioEngine::control_param_value")
+        self.assertNotIn("std::sin(kTwoPi * 7120.0f", render_body)
+        self.assertNotIn("std::sin(kTwoPi * 6120.0f", render_body)
+
+        bass_body = body_between("float AudioEngine::render_bass()", "float AudioEngine::apply_mix_eq")
+        self.assertNotIn("std::asin(std::sin", bass_body)
+        self.assertNotIn("std::sin(kTwoPi * 7.0f", bass_body)
+
+    def test_v172_drum_voice_hot_path_uses_lightweight_math(self):
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+        start_index = audio_source.index("float AudioEngine::render_voice")
+        end_index = audio_source.index("float AudioEngine::control_param_value", start_index)
+        render_voice = audio_source[start_index:end_index]
+
+        for token in [
+            "fast_decay",
+            "fast_sine",
+            "fast_pitch_ratio",
+            "tick_phase",
+            "kick_punch",
+            "snare_shell",
+            "hat_metallic",
+        ]:
+            self.assertIn(token, render_voice)
+
+        for token in [
+            "std::exp",
+            "std::sin",
+            "std::pow",
+        ]:
+            self.assertNotIn(token, render_voice)
+
+    def test_v173_audio_task_has_daisy_style_realtime_guardrails(self):
+        app_source = (ROOT / "main" / "app_main.cpp").read_text(encoding="utf-8")
+        transport_header = (ROOT / "main" / "include" / "transport.hpp").read_text(encoding="utf-8")
+        audio_header = (ROOT / "main" / "include" / "audio_engine.hpp").read_text(encoding="utf-8")
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+
+        for token in [
+            "constexpr std::size_t kAudioFrames = 512",
+            "kAudioTaskPriority = configMAX_PRIORITIES - 1",
+            "kAudioBlockBudgetUs",
+            "record_audio_timing",
+        ]:
+            self.assertIn(token, app_source + audio_header + audio_source)
+
+        for token in [
+            "audio_overrun_count",
+            "audio_block_peak_us",
+            "audio_load_shed",
+            "audio_load_shed_blocks_",
+            "kLoadShedBlocks",
+            "kMaxRenderedVoices",
+        ]:
+            self.assertIn(token, transport_header + audio_header + audio_source)
+
+        render_body = audio_source[
+            audio_source.index("std::size_t AudioEngine::render_stereo_i16"):
+            audio_source.index("void AudioEngine::trigger_step")
+        ]
+        for token in [
+            "uint8_t rendered_voices = 0",
+            "rendered_voices < kMaxRenderedVoices",
+            "const bool load_shed = audio_load_shed_blocks_.load() > 0",
+            "if (load_shed)",
+        ]:
+            self.assertIn(token, render_body)
+
+    def test_v174_unused_tab5_hardware_is_not_started_at_runtime(self):
+        app_source = (ROOT / "main" / "app_main.cpp").read_text(encoding="utf-8")
+        app_cmake = (ROOT / "main" / "CMakeLists.txt").read_text(encoding="utf-8")
+        adapter_source = (ROOT / "components" / "tab5_bsp_adapter" / "tab5_bsp_adapter.cpp").read_text(encoding="utf-8")
+        adapter_header = (ROOT / "components" / "tab5_bsp_adapter" / "include" / "tab5_bsp_adapter.hpp").read_text(encoding="utf-8")
+
+        for token in [
+            "bsp_camera_start",
+            "bsp_usb_host_start",
+            "bsp_sdcard_mount",
+            "bsp_spiffs_mount",
+            "bsp_audio_codec_microphone_init",
+            "esp_wifi_init",
+            "esp_bt_controller_init",
+            "nvs_flash_init",
+        ]:
+            self.assertNotIn(token, app_source + adapter_source)
+
+        self.assertNotIn("nvs_flash", app_cmake)
+        self.assertIn("g_bsp.disable_unused_hardware()", app_source)
+        self.assertIn("disable_unused_hardware", adapter_header + adapter_source)
+        self.assertIn("BSP_FEATURE_CAMERA, false", adapter_source)
+
+    def test_v180_es8388_output_profiles_and_codec_observability(self):
+        app_source = (ROOT / "main" / "app_main.cpp").read_text(encoding="utf-8")
+        transport_header = (ROOT / "main" / "include" / "transport.hpp").read_text(encoding="utf-8")
+        audio_header = (ROOT / "main" / "include" / "audio_engine.hpp").read_text(encoding="utf-8")
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+        adapter_header = (ROOT / "components" / "tab5_bsp_adapter" / "include" / "tab5_bsp_adapter.hpp").read_text(encoding="utf-8")
+        adapter_source = (ROOT / "components" / "tab5_bsp_adapter" / "tab5_bsp_adapter.cpp").read_text(encoding="utf-8")
+
+        for token in [
+            "enum class OutputProfile",
+            "OutputProfile::Speaker",
+            "OutputProfile::Headphone",
+            "output_profile",
+            "set_output_profile",
+            "speaker_bass_trim_",
+            "speaker_low_trim_",
+            "limiter_gain_reduction_percent",
+        ]:
+            self.assertIn(token, transport_header + audio_header + audio_source)
+
+        for token in [
+            "dump_codec_regs",
+            "read_codec_reg",
+            "set_codec_mute_safe",
+            "apply_volume_curve",
+            "headphone_inserted() const",
+            "esp_codec_dev_dump_reg",
+            "esp_codec_dev_read_reg",
+            "esp_codec_dev_set_out_mute",
+            "esp_codec_dev_set_vol_curve",
+        ]:
+            self.assertIn(token, adapter_header + adapter_source)
+
+        for token in [
+            "g_audio.set_output_profile",
+            "g_bsp.headphone_inserted() ? tab5drum::OutputProfile::Headphone : tab5drum::OutputProfile::Speaker",
+            "g_bsp.dump_codec_regs()",
+        ]:
+            self.assertIn(token, app_source)
+
+        audio_task_body = app_source[app_source.index("void audio_task"):app_source.index("void direct_panel_test")]
+        for token in [
+            "dump_codec_regs",
+            "read_codec_reg",
+            "set_codec_mute_safe",
+            "esp_codec_dev_write_reg",
+            "esp_codec_dev_read_reg",
+        ]:
+            self.assertNotIn(token, audio_task_body)
+
+    def test_v181_mix_eq_boosts_are_audible_but_bounded(self):
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+
+        for token in [
+            "constexpr float kMixEqLowBoost = 0.62f",
+            "constexpr float kMixEqMidBoost = 0.72f",
+            "constexpr float kMixEqHighBoost = 0.58f",
+            "boosted += low_band * kMixEqLowBoost",
+            "boosted += mid_band * kMixEqMidBoost",
+            "boosted += high_band * kMixEqHighBoost",
+            "return std::clamp(boosted, -1.40f, 1.40f)",
+        ]:
+            self.assertIn(token, audio_source)
+
+        for token in [
+            "boosted += low_band * 0.18f",
+            "boosted += mid_band * 0.20f",
+            "boosted += high_band * 0.16f",
+            "constexpr float kMixEqLowBoost = 0.34f",
+            "constexpr float kMixEqMidBoost = 0.40f",
+            "constexpr float kMixEqHighBoost = 0.32f",
+        ]:
+            self.assertNotIn(token, audio_source)
+
+    def test_v182_mix_eq_tracks_signal_while_bypassed_and_uses_broader_high_band(self):
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+        start = audio_source.index("float AudioEngine::apply_mix_eq")
+        end = audio_source.index("const Pattern* AudioEngine::current_pattern", start)
+        body = audio_source[start:end]
+
+        self.assertIn("const float high_band = sample - mid", body)
+        self.assertIn("if (mask == 0) {\n        return sample;\n    }", body)
+        self.assertLess(body.index("low += (sample - low)"), body.index("if (mask == 0)"))
+        self.assertLess(body.index("const float high_band = sample - mid"), body.index("if (mask == 0)"))
+        self.assertNotIn("const float high_band = sample - high", body)
+
+    def test_v183_mix_eq_is_not_bypassed_by_audio_load_shed(self):
+        audio_source = (ROOT / "main" / "audio_engine.cpp").read_text(encoding="utf-8")
+        start = audio_source.index("std::size_t AudioEngine::render_stereo_i16")
+        end = audio_source.index("void AudioEngine::trigger_step", start)
+        body = audio_source[start:end]
+
+        for token in [
+            "drums = apply_mix_eq(drums, MixEqBus::Drum, drum_eq_mask_.load())",
+            "float bass_sample = apply_mix_eq(render_bass(), MixEqBus::Bass, bass_eq_mask_.load())",
+            "sample = apply_mix_eq(sample, MixEqBus::Master, master_eq_mask_.load())",
+        ]:
+            self.assertIn(token, body)
+
+        for token in [
+            "if (!load_shed) {\n            drums = apply_mix_eq",
+            "load_shed ? render_bass()\n                                          : apply_mix_eq",
+            "if (!load_shed) {\n            sample = apply_mix_eq",
+        ]:
+            self.assertNotIn(token, body)
 
 
 if __name__ == "__main__":

@@ -14,7 +14,6 @@ idf_component_register(
         espressif__bmi270
         lvgl
         m5stack_tab5
-        nvs_flash
         tab5_bsp_adapter
     EMBED_TXTFILES
         "patterns.json"

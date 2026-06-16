@@ -9,6 +9,16 @@ namespace {
 
 const char* const kTag = "tab5_bsp";
 
+esp_codec_dev_vol_map_t kAby55VolumeCurve[] = {
+    {0, -96.0f},
+    {8, -58.0f},
+    {24, -36.0f},
+    {48, -20.0f},
+    {72, -9.0f},
+    {90, -4.0f},
+    {100, -1.5f},
+};
+
 esp_codec_dev_handle_t as_codec(void* handle)
 {
     return static_cast<esp_codec_dev_handle_t>(handle);
@@ -62,9 +72,26 @@ esp_err_t Tab5BspAdapter::init_audio(uint32_t sample_rate, uint8_t volume)
     speaker_enabled_ = true;
     speaker_route_known_ = true;
 
+    ret = apply_volume_curve();
+    ESP_LOGI(kTag, "init_audio volume curve returned %s", esp_err_to_name(ret));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
     ret = set_volume(volume);
     ESP_LOGI(kTag, "init_audio set volume returned %s", esp_err_to_name(ret));
     return ret;
+}
+
+esp_err_t Tab5BspAdapter::disable_unused_hardware()
+{
+    const esp_err_t ret = bsp_feature_enable(BSP_FEATURE_CAMERA, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(kTag, "disable camera power failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(kTag, "unused camera power disabled");
+    return ESP_OK;
 }
 
 esp_err_t Tab5BspAdapter::set_volume(uint8_t volume)
@@ -74,6 +101,48 @@ esp_err_t Tab5BspAdapter::set_volume(uint8_t volume)
     }
 
     return esp_codec_dev_set_out_vol(as_codec(speaker_codec_), volume > 100 ? 100 : volume);
+}
+
+esp_err_t Tab5BspAdapter::apply_volume_curve()
+{
+    if (speaker_codec_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    esp_codec_dev_vol_curve_t curve = {};
+    curve.vol_map = kAby55VolumeCurve;
+    curve.count = static_cast<int>(sizeof(kAby55VolumeCurve) / sizeof(kAby55VolumeCurve[0]));
+    return esp_codec_dev_set_vol_curve(as_codec(speaker_codec_), &curve);
+}
+
+esp_err_t Tab5BspAdapter::dump_codec_regs()
+{
+    if (speaker_codec_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return esp_codec_dev_dump_reg(as_codec(speaker_codec_));
+}
+
+esp_err_t Tab5BspAdapter::read_codec_reg(uint8_t reg, int* value)
+{
+    if (speaker_codec_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (value == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    return esp_codec_dev_read_reg(as_codec(speaker_codec_), reg, value);
+}
+
+esp_err_t Tab5BspAdapter::set_codec_mute_safe(bool muted)
+{
+    if (speaker_codec_ == nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    return esp_codec_dev_set_out_mute(as_codec(speaker_codec_), muted);
 }
 
 esp_err_t Tab5BspAdapter::read_headphone_inserted(bool* inserted)
@@ -104,6 +173,7 @@ esp_err_t Tab5BspAdapter::update_headphone_route()
     if (ret != ESP_OK) {
         return ret;
     }
+    headphone_inserted_ = inserted;
 
     const bool speaker_should_enable = !inserted;
     if (speaker_route_known_ && speaker_enabled_ == speaker_should_enable) {
@@ -119,6 +189,11 @@ esp_err_t Tab5BspAdapter::update_headphone_route()
                  speaker_should_enable ? "enabled" : "muted");
     }
     return ret;
+}
+
+bool Tab5BspAdapter::headphone_inserted() const
+{
+    return headphone_inserted_;
 }
 
 esp_err_t Tab5BspAdapter::write_audio(const int16_t* stereo_samples, std::size_t frames)

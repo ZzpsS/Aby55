@@ -10,6 +10,94 @@
 
 namespace tab5drum {
 
+enum class ControlCurve : uint8_t {
+    Linear = 0,
+    Log,
+    Exp,
+    Cube,
+};
+
+class ControlParam {
+public:
+    void configure(float min_value, float max_value, ControlCurve curve, float smooth_ms, uint32_t sample_rate,
+                   float initial_ui);
+    void set_target(float ui_value);
+    float process();
+    float current() const;
+
+private:
+    float map(float ui_value) const;
+
+    std::atomic<float> target_{0.0f};
+    float last_target_ = -1000.0f;
+    float target_mapped_ = 0.0f;
+    float current_ = 0.0f;
+    float min_ = 0.0f;
+    float max_ = 1.0f;
+    float smoothing_ = 1.0f;
+    ControlCurve curve_ = ControlCurve::Linear;
+};
+
+enum class EnvelopeStage : uint8_t {
+    Idle = 0,
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+};
+
+class BassAdsr {
+public:
+    void configure(uint32_t sample_rate);
+    void set(float attack_s, float decay_s, float sustain, float release_s);
+    void trigger_gate(bool on, bool retrigger = true, float level = 1.0f);
+    float process();
+    bool is_idle() const;
+    EnvelopeStage stage() const;
+
+private:
+    uint32_t sample_rate_ = 44100;
+    EnvelopeStage stage_ = EnvelopeStage::Idle;
+    float value_ = 0.0f;
+    float attack_s_ = 0.006f;
+    float decay_s_ = 0.16f;
+    float sustain_ = 0.32f;
+    float release_s_ = 0.08f;
+    float level_ = 1.0f;
+    float attack_inc_ = 0.01f;
+    float decay_step_ = 0.001f;
+    float release_step_ = 0.001f;
+};
+
+class DcBlocker {
+public:
+    float process(float sample);
+    void reset();
+
+private:
+    float x1_ = 0.0f;
+    float y1_ = 0.0f;
+};
+
+class SoftLimiter {
+public:
+    float process(float sample);
+    uint32_t clip_count() const;
+    uint8_t peak_percent() const;
+    uint8_t gain_reduction_percent() const;
+    void reset_stats();
+
+private:
+    uint32_t clip_count_ = 0;
+    float peak_ = 0.0f;
+    float gain_reduction_ = 0.0f;
+};
+
+class DriveStage {
+public:
+    float process(float sample, float drive);
+};
+
 class AudioEngine {
 public:
     explicit AudioEngine(uint32_t sample_rate);
@@ -22,6 +110,7 @@ public:
     void adjust_swing(int delta);
     void set_volume(uint8_t volume);
     void adjust_volume(int delta);
+    void set_output_profile(OutputProfile profile);
     void set_drum_volume(uint8_t volume);
     void adjust_drum_volume(int delta);
     void set_bass_volume(uint8_t volume);
@@ -53,6 +142,7 @@ public:
     void set_drum_param(DrumParam param, uint8_t value);
     void set_playing(bool playing);
     void tap_tempo(uint64_t now_ms);
+    void record_audio_timing(uint32_t render_us, uint32_t write_us, uint32_t budget_us);
 
     TransportState state() const;
     BassStep bass_step(std::size_t step) const;
@@ -61,6 +151,9 @@ public:
     std::size_t render_stereo_i16(int16_t* out, std::size_t frames);
 
 private:
+    static constexpr uint8_t kMaxRenderedVoices = 18;
+    static constexpr uint8_t kLoadShedBlocks = 48;
+
     struct ActiveVoice {
         DrumVoice voice = DrumVoice::Kick;
         float velocity = 0.0f;
@@ -95,6 +188,9 @@ private:
     void trigger_bass_step(std::size_t step);
     float render_voice(ActiveVoice& voice);
     float render_bass();
+    float apply_speaker_low_trim(float sample);
+    float control_param_value(BassParam param);
+    void refresh_bass_control_targets();
     float apply_mix_eq(float sample, MixEqBus bus, uint8_t mask);
     const Pattern* current_pattern() const;
     uint32_t next_step_samples(std::size_t step) const;
@@ -112,6 +208,7 @@ private:
     std::atomic<uint16_t> bpm_{120};
     std::atomic<uint8_t> swing_{50};
     std::atomic<uint8_t> volume_{80};
+    std::atomic<uint8_t> output_profile_{static_cast<uint8_t>(OutputProfile::Speaker)};
     std::atomic<uint8_t> drum_volume_{78};
     std::atomic<uint8_t> bass_volume_{34};
     std::atomic<uint8_t> master_eq_mask_{0};
@@ -160,6 +257,24 @@ private:
     TapTempo tap_tempo_;
     std::array<ActiveVoice, 32> voices_ = {};
     BassSynth bass_;
+    std::array<ControlParam, kBassParamCount> bass_control_params_ = {};
+    BassAdsr bass_adsr_;
+    DcBlocker bass_dc_blocker_;
+    DcBlocker drum_bus_dc_blocker_;
+    DcBlocker master_dc_blocker_;
+    SoftLimiter bass_limiter_;
+    SoftLimiter drum_limiter_;
+    SoftLimiter master_limiter_;
+    DriveStage drive_stage_;
+    float speaker_bass_trim_ = 0.0f;
+    float speaker_low_trim_ = 0.0f;
+    std::atomic<uint32_t> audio_clip_count_{0};
+    std::atomic<uint8_t> audio_peak_percent_{0};
+    std::atomic<uint8_t> limiter_gain_reduction_percent_{0};
+    std::atomic<uint8_t> bass_env_stage_{static_cast<uint8_t>(EnvelopeStage::Idle)};
+    std::atomic<uint32_t> audio_overrun_count_{0};
+    std::atomic<uint32_t> audio_block_peak_us_{0};
+    std::atomic<uint8_t> audio_load_shed_blocks_{0};
     std::array<float, kMixEqBusCount> mix_eq_low_ = {};
     std::array<float, kMixEqBusCount> mix_eq_mid_ = {};
     std::array<float, kMixEqBusCount> mix_eq_high_ = {};

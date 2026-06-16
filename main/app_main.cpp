@@ -12,14 +12,15 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "nvs_flash.h"
 #include "tab5_bsp_adapter.hpp"
 #include "ui_controller.hpp"
 
 namespace {
 
 constexpr uint32_t kSampleRate = 44100;
-constexpr std::size_t kAudioFrames = 256;
+constexpr std::size_t kAudioFrames = 512;
+constexpr uint32_t kAudioBlockBudgetUs = static_cast<uint32_t>((kAudioFrames * 1000000ULL) / kSampleRate);
+constexpr UBaseType_t kAudioTaskPriority = configMAX_PRIORITIES - 1;
 constexpr uint32_t kHeadphoneRoutePollMs = 250;
 const char* const kTag = "tab5_drummer";
 constexpr bool kDirectPanelTest = false;
@@ -35,8 +36,15 @@ void audio_task(void*)
     std::array<int16_t, kAudioFrames * 2> buffer = {};
 
     while (true) {
+        const int64_t block_start_us = esp_timer_get_time();
         g_audio.render_stereo_i16(buffer.data(), kAudioFrames);
+        const int64_t render_done_us = esp_timer_get_time();
         const esp_err_t ret = g_bsp.write_audio(buffer.data(), kAudioFrames);
+        const int64_t write_done_us = esp_timer_get_time();
+        g_audio.record_audio_timing(
+            static_cast<uint32_t>(std::max<int64_t>(0, render_done_us - block_start_us)),
+            static_cast<uint32_t>(std::max<int64_t>(0, write_done_us - render_done_us)),
+            kAudioBlockBudgetUs);
         if (ret != ESP_OK) {
             ESP_LOGW(kTag, "audio write failed: %s", esp_err_to_name(ret));
             vTaskDelay(pdMS_TO_TICKS(5));
@@ -155,7 +163,9 @@ void poll_headphone_route()
     const esp_err_t ret = g_bsp.update_headphone_route();
     if (ret != ESP_OK) {
         ESP_LOGW(kTag, "headphone route update failed: %s", esp_err_to_name(ret));
+        return;
     }
+    g_audio.set_output_profile(g_bsp.headphone_inserted() ? tab5drum::OutputProfile::Headphone : tab5drum::OutputProfile::Speaker);
 }
 
 }  // namespace
@@ -165,11 +175,6 @@ extern "C" void app_main(void)
     if (kDirectPanelTest) {
         direct_panel_test();
         return;
-    }
-
-    esp_err_t ret = nvs_flash_init();
-    if (ret != ESP_OK) {
-        ESP_LOGW(kTag, "nvs init returned %s; continuing without persisted settings", esp_err_to_name(ret));
     }
 
     if (!g_catalog.load_builtin()) {
@@ -182,9 +187,12 @@ extern "C" void app_main(void)
 
     ESP_LOGI(kTag, "init display");
     ESP_ERROR_CHECK(g_bsp.init_display());
+    ESP_ERROR_CHECK(g_bsp.disable_unused_hardware());
     ESP_LOGI(kTag, "init audio");
     ESP_ERROR_CHECK(g_bsp.init_audio(kSampleRate, 80));
     ESP_ERROR_CHECK(g_bsp.update_headphone_route());
+    g_audio.set_output_profile(g_bsp.headphone_inserted() ? tab5drum::OutputProfile::Headphone : tab5drum::OutputProfile::Speaker);
+    ESP_ERROR_CHECK(g_bsp.dump_codec_regs());
     init_motion_sensor();
 
     ESP_LOGI(kTag, "create ui");
@@ -199,7 +207,7 @@ extern "C" void app_main(void)
     }
 
     ESP_LOGI(kTag, "start audio task");
-    xTaskCreatePinnedToCore(audio_task, "tab5_audio", 16384, nullptr, configMAX_PRIORITIES - 3, nullptr, 1);
+    xTaskCreatePinnedToCore(audio_task, "tab5_audio", 16384, nullptr, kAudioTaskPriority, nullptr, 1);
     ESP_LOGI(kTag, "app ready");
 
     while (true) {
